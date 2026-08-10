@@ -1,4 +1,6 @@
 # Latest Update
+08/10/2026 version2.2  Added another attempt to fix rare stream being more than 3 minutes behind and racing catchup.  Updates so regional maps and radar are drawn full-screen and properly centered on the user's location.
+
 
 07/11/2026 version2.1  Added attempt to fix rare stream being more than 3 minutes behind and racing catchup.  Added better logging to troubleshoot this issue.http://<host>:9798/health
 

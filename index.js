@@ -16,7 +16,7 @@ process.setMaxListeners(50);
 
 const app = express();
 
-const VERSION = '2.1'; // version 2.1 - backpressure + restart logging
+const VERSION = '2.2'; // version 2.2 - attempt fix for racing and radar map update.
 const ZIP_CODE = process.env.ZIP_CODE || '90210';
 const WS4KP_HOST = process.env.WS4KP_HOST || 'localhost';
 const WS4KP_PORT = process.env.WS4KP_PORT || '8080';
