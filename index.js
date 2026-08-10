@@ -225,14 +225,21 @@ async function startBrowser(reason = 'initial startup') {
 			if (widescreenChecked && VIEW_MODE === 'standard' || !widescreenChecked && VIEW_MODE === 'wide') await widescreenCheckbox.click();
     } catch {
 				try {
-				// 7.x (wide/portrait/enhanced behavior)
-				// get the selector box and select widescreen
-				const viewSelector = await page.waitForSelector('#settings-viewMode-select');
-				// set the desired mode
-				await viewSelector.evaluate((el, VIEW_MODE) => {
-					el.value = VIEW_MODE;
-					el.dispatchEvent(new Event('change'));
-				}, VIEW_MODE);
+					// 7.x (wide/portrait/enhanced behavior)
+					// get the selector box and select widescreen
+					const viewSelector = await workingPage.waitForSelector('#settings-viewMode-select');
+					// set the desired mode
+					const startMode = await viewSelector.evaluate((el, viewMode) => {
+						const elStartMode = el.value;
+						el.value = viewMode;
+						if (elStartMode !== viewMode)	el.dispatchEvent(new Event('change'));
+						return elStartMode;
+					}, VIEW_MODE);
+					// force a click of refresh button to cause screens to re-draw/size if switching into or out of enhanced mode
+					if (startMode !== VIEW_MODE) {
+						const refreshButton = await workingPage.waitForSelector('#NavigateRefresh');
+						refreshButton.evaluate((el) => { el.click(); });
+					}
 			} catch {}
 
 		}
