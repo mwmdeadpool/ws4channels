@@ -10,13 +10,11 @@ const os = require('os');
 // exit/SIGINT/SIGTERM/SIGHUP listeners on every browser launch and does not
 // always clean them up on close. This silences the noisy
 // MaxListenersExceededWarning so real problems are easier to see in the logs.
-// The restart counter/logging below is what actually tells us if restarts
-// are happening too often.
 process.setMaxListeners(50);
 
 const app = express();
 
-const VERSION = '2.2'; // version 2.2 - attempt fix for racing and radar map update.
+const VERSION = '2.3'; // version 2.3 - dev-shm fix, screenshot timing + hang watchdog, restart lock, optional scheduled refresh
 const ZIP_CODE = process.env.ZIP_CODE || '90210';
 const WS4KP_HOST = process.env.WS4KP_HOST || 'localhost';
 const WS4KP_PORT = process.env.WS4KP_PORT || '8080';
@@ -25,6 +23,18 @@ const WS4KP_URL = `http://${WS4KP_HOST}:${WS4KP_PORT}`;
 const PERMALINK_URL = process.env.PERMALINK_URL || null;
 const HLS_SETUP_DELAY = 2000;
 const FRAME_RATE = process.env.FRAME_RATE || 10;
+
+// Optional proactive browser refresh. If set to a number > 0, the browser
+// will be relaunched on this interval (minutes) regardless of whether
+// anything has gone wrong. 0 = disabled (default).
+const BROWSER_REFRESH_MINUTES = parseInt(process.env.BROWSER_REFRESH_MINUTES || '0', 10);
+
+// Watchdog thresholds for a single page.screenshot() call.
+// WARN: log loudly that a capture is taking unusually long, but keep waiting.
+// FORCE_RESTART: give up on it entirely and relaunch the browser, since a
+// screenshot stuck this long is effectively a hang, not just slowness.
+const SCREENSHOT_WARN_MS = 3000;
+const SCREENSHOT_FORCE_RESTART_MS = 15000;
 
 const OUTPUT_DIR = path.join(__dirname, 'output');
 const AUDIO_DIR = path.join(__dirname, 'music');
@@ -72,15 +82,27 @@ let ffmpegStream = null;
 let browser = null;
 let page = null;
 let captureInterval = null;
+let watchdogInterval = null;
+let refreshTimer = null;
 let isStreamReady = false;
 
-// --- New state for backpressure + overlap protection + restart diagnostics ---
-let isCapturing = false;      // prevents overlapping screenshot calls
-let canWrite = true;          // false when ffmpegStream's internal buffer is full
-let browserRestartCount = 0;  // how many times we've had to relaunch the browser
+// --- State for backpressure + overlap protection + restart diagnostics ---
+let isCapturing = false;         // prevents overlapping screenshot calls
+let isRestartingBrowser = false; // prevents overlapping/concurrent browser launches
+let canWrite = true;             // false when ffmpegStream's internal buffer is full
+let browserRestartCount = 0;     // how many times we've had to relaunch the browser
 let framesWritten = 0;
 let framesSkippedBackpressure = 0;
 let framesSkippedOverlap = 0;
+let framesSkippedRestarting = 0;
+
+// --- Screenshot timing + hang watchdog instrumentation ---
+let totalScreenshotMs = 0;
+let maxScreenshotMs = 0;
+let captureStartedAt = null;   // timestamp of the currently in-flight screenshot, or null
+let hangWarningsIssued = 0;    // how many times a single screenshot exceeded SCREENSHOT_WARN_MS
+let hangForcedRestarts = 0;    // how many times a single screenshot exceeded SCREENSHOT_FORCE_RESTART_MS
+let lastHangWarnLoggedAt = 0;  // avoid spamming the log every watchdog tick for the same stuck call
 
 const waitFor = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -170,98 +192,159 @@ function generateXMLTV(host) {
 }
 
 async function startBrowser(reason = 'initial startup') {
-  browserRestartCount++;
-  logTS(`Launching browser (launch #${browserRestartCount}, reason: ${reason})`);
-  if(browser) await browser.close().catch(()=>{});
-  browser = await puppeteer.launch({
-    headless: true,
-    args:['--no-sandbox','--disable-setuid-sandbox','--disable-infobars','--ignore-certificate-errors','--window-size=1280,720'],
-    defaultViewport: null
-  });
-  page = await browser.newPage();
-  if (PERMALINK_URL) {
-    console.log(`Using custom permalink URL: ${PERMALINK_URL}`);
-    await page.goto(PERMALINK_URL, { waitUntil: 'networkidle2', timeout: 30000 });
-  } else {
-    await page.goto(WS4KP_URL, { waitUntil: 'networkidle2', timeout: 30000 });
-    try {
-      const zipInput = await page.waitForSelector('input[placeholder="Zip or City, State"], input', { timeout: 5000 });
-      if (zipInput) {
-        // type the zip code
-        await zipInput.type(ZIP_CODE, { delay: 100 });
-        // wit for suggestions box
-        await page.waitForSelector('#divQuery .autocomplete-suggestions .suggestion');
-        // select the first suggestion
-        await page.keyboard.press('ArrowDown');
-        // wait for the selection to be highlighted
-        await page.waitForSelector('#divQuery .autocomplete-suggestions .suggestion.selected');
-        // find and press the submit button
-        const goButton = await page.$('button[type="submit"]');
-        if (goButton) await goButton.click(); else await zipInput.press('Enter');
-        // wait for weather content to update
-        await page.waitForSelector('div.weather-display, #weather-content', { timeout: 30000 });
-      }
-    } catch {}
-
-    // force ws4kp app to wide screen and kiosk (full screen), this removes the need to specify exactly where to crop for the screenshot
-
-    try {
-      // get the widescreen checkbox from the settings section
-			// will throw if the element is not present on ws4kp 7.x and a different path is taken in the catch statement
-			// which is the reason for the short timeout
-      const widescreenCheckbox = await page.waitForSelector('#settings-wide-checkbox', {timeout: 100});
-
-
-			// 6.x (classic) behavior
-			// only supports standard and wide, check and exit with an error if not doable
-			if (VIEW_MODE === 'wide-enhanced' || VIEW_MODE === 'portrait-enhanced') {
-				console.error(`This version of ws4kp only supports VIEW_MODE 'standard' or 'enhanced'`);
-				await browser.close();
-				process.exit();
-			}
-			// get the checkbox's current state and click it to turn it on if necessary
-			const widescreenChecked = await widescreenCheckbox.evaluate((el) => el.checked);
-			// click the checkbox on a mismatch
-			if (widescreenChecked && VIEW_MODE === 'standard' || !widescreenChecked && VIEW_MODE === 'wide') await widescreenCheckbox.click();
-    } catch {
-				try {
-					// 7.x (wide/portrait/enhanced behavior)
-					// get the selector box and select widescreen
-					const viewSelector = await workingPage.waitForSelector('#settings-viewMode-select');
-					// set the desired mode
-					const startMode = await viewSelector.evaluate((el, viewMode) => {
-						const elStartMode = el.value;
-						el.value = viewMode;
-						if (elStartMode !== viewMode)	el.dispatchEvent(new Event('change'));
-						return elStartMode;
-					}, VIEW_MODE);
-					// force a click of refresh button to cause screens to re-draw/size if switching into or out of enhanced mode
-					if (startMode !== VIEW_MODE) {
-						const refreshButton = await workingPage.waitForSelector('#NavigateRefresh');
-						refreshButton.evaluate((el) => { el.click(); });
-					}
-			} catch {}
-
-		}
-		finally {
-			// both 6.x and 7.x support kiosk as a checkbox
-      // and now for kiosk
-      const kioskCheckbox = await page.waitForSelector('#settings-kiosk-checkbox');    // set the checkbox
-      const kioskChecked = await kioskCheckbox.evaluate((el) => el.checked);
-      if (!kioskChecked) await kioskCheckbox.click();
-		}
+  // Hard lock: only one browser launch can be in progress at a time.
+  if (isRestartingBrowser) {
+    logTS('startBrowser() called while a restart was already in progress — ignoring duplicate call');
+    return;
   }
-  await page.setViewport({ ...VIEW_DIMENSIONS });
+  isRestartingBrowser = true;
 
-  // Reset capture guards after a fresh browser/page is ready.
-  isCapturing = false;
-  canWrite = true;
-  logTS(`Browser ready (launch #${browserRestartCount})`);
+  try {
+    browserRestartCount++;
+    logTS(`Launching browser (launch #${browserRestartCount}, reason: ${reason})`);
+    if(browser) await browser.close().catch(()=>{});
+    browser = await puppeteer.launch({
+      headless: true,
+      args:[
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-infobars',
+        '--ignore-certificate-errors',
+        '--window-size=1280,720',
+        // These four are common fixes for headless Chrome intermittently
+        // hanging/stalling inside Docker containers, most notably the tiny
+        // (64MB) default /dev/shm size. --disable-dev-shm-usage makes
+        // Chrome use /tmp instead, which is the leading suspect for the
+        // "screenshot calls hang for seconds despite the page rendering
+        // fine" pattern we're seeing.
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--disable-software-rasterizer',
+        '--disable-extensions'
+      ],
+      defaultViewport: null
+    });
+    page = await browser.newPage();
+    if (PERMALINK_URL) {
+      console.log(`Using custom permalink URL: ${PERMALINK_URL}`);
+      await page.goto(PERMALINK_URL, { waitUntil: 'networkidle2', timeout: 30000 });
+    } else {
+      await page.goto(WS4KP_URL, { waitUntil: 'networkidle2', timeout: 30000 });
+      try {
+        const zipInput = await page.waitForSelector('input[placeholder="Zip or City, State"], input', { timeout: 5000 });
+        if (zipInput) {
+          // type the zip code
+          await zipInput.type(ZIP_CODE, { delay: 100 });
+          // wit for suggestions box
+          await page.waitForSelector('#divQuery .autocomplete-suggestions .suggestion');
+          // select the first suggestion
+          await page.keyboard.press('ArrowDown');
+          // wait for the selection to be highlighted
+          await page.waitForSelector('#divQuery .autocomplete-suggestions .suggestion.selected');
+          // find and press the submit button
+          const goButton = await page.$('button[type="submit"]');
+          if (goButton) await goButton.click(); else await zipInput.press('Enter');
+          // wait for weather content to update
+          await page.waitForSelector('div.weather-display, #weather-content', { timeout: 30000 });
+        }
+      } catch {}
+
+      // force ws4kp app to wide screen and kiosk (full screen), this removes the need to specify exactly where to crop for the screenshot
+
+      try {
+        // get the widescreen checkbox from the settings section
+        // will throw if the element is not present on ws4kp 7.x and a different path is taken in the catch statement
+        // which is the reason for the short timeout
+        const widescreenCheckbox = await page.waitForSelector('#settings-wide-checkbox', {timeout: 100});
+
+
+        // 6.x (classic) behavior
+        // only supports standard and wide, check and exit with an error if not doable
+        if (VIEW_MODE === 'wide-enhanced' || VIEW_MODE === 'portrait-enhanced') {
+          console.error(`This version of ws4kp only supports VIEW_MODE 'standard' or 'enhanced'`);
+          await browser.close();
+          process.exit();
+        }
+        // get the checkbox's current state and click it to turn it on if necessary
+        const widescreenChecked = await widescreenCheckbox.evaluate((el) => el.checked);
+        // click the checkbox on a mismatch
+        if (widescreenChecked && VIEW_MODE === 'standard' || !widescreenChecked && VIEW_MODE === 'wide') await widescreenCheckbox.click();
+      } catch {
+              try {
+              // 7.x (wide/portrait/enhanced behavior)
+              // get the selector box and select widescreen
+              const viewSelector = await page.waitForSelector('#settings-viewMode-select');
+              // set the desired mode
+              await viewSelector.evaluate((el, VIEW_MODE) => {
+                el.value = VIEW_MODE;
+                el.dispatchEvent(new Event('change'));
+              }, VIEW_MODE);
+            } catch {}
+
+      }
+      finally {
+        // both 6.x and 7.x support kiosk as a checkbox
+        // and now for kiosk
+        const kioskCheckbox = await page.waitForSelector('#settings-kiosk-checkbox');    // set the checkbox
+        const kioskChecked = await kioskCheckbox.evaluate((el) => el.checked);
+        if (!kioskChecked) await kioskCheckbox.click();
+      }
+    }
+    await page.setViewport({ ...VIEW_DIMENSIONS });
+
+    // Reset capture guards after a fresh browser/page is ready.
+    isCapturing = false;
+    canWrite = true;
+    captureStartedAt = null;
+    logTS(`Browser ready (launch #${browserRestartCount})`);
+  } finally {
+    isRestartingBrowser = false;
+  }
+}
+
+function scheduleBrowserRefresh() {
+  if (refreshTimer) clearInterval(refreshTimer);
+  if (!BROWSER_REFRESH_MINUTES || BROWSER_REFRESH_MINUTES <= 0) {
+    logTS('Scheduled browser refresh disabled (BROWSER_REFRESH_MINUTES not set)');
+    return;
+  }
+  logTS(`Scheduled browser refresh enabled: every ${BROWSER_REFRESH_MINUTES} minute(s)`);
+  refreshTimer = setInterval(() => {
+    startBrowser(`scheduled refresh (${BROWSER_REFRESH_MINUTES}m interval)`);
+  }, BROWSER_REFRESH_MINUTES * 60 * 1000);
+}
+
+function startWatchdog() {
+  if (watchdogInterval) clearInterval(watchdogInterval);
+  // Checks once a second whether the currently in-flight screenshot call
+  // has been running suspiciously long. This is the piece that lets us see
+  // a hang WHILE it's happening, rather than only after it eventually
+  // resolves (if it ever does).
+  watchdogInterval = setInterval(() => {
+    if (!isCapturing || !captureStartedAt) return;
+    const inFlightMs = Date.now() - captureStartedAt;
+
+    if (inFlightMs > SCREENSHOT_FORCE_RESTART_MS) {
+      hangForcedRestarts++;
+      logTS(`WATCHDOG: screenshot has been stuck for ${inFlightMs}ms (over the ${SCREENSHOT_FORCE_RESTART_MS}ms limit) — forcing a browser restart`);
+      captureStartedAt = null;
+      startBrowser(`screenshot hang timeout (${inFlightMs}ms)`);
+      return;
+    }
+
+    if (inFlightMs > SCREENSHOT_WARN_MS && Date.now() - lastHangWarnLoggedAt > 1000) {
+      lastHangWarnLoggedAt = Date.now();
+      hangWarningsIssued++;
+      logTS(`WATCHDOG WARNING: screenshot has been in-flight for ${inFlightMs}ms so far (frame #${framesWritten})`);
+    }
+  }, 1000);
 }
 
 async function startTranscoding() {
   await startBrowser('initial startup');
   createAudioInputFile();
+  scheduleBrowserRefresh();
+  startWatchdog();
 
   // Give the PassThrough a modest, explicit buffer size. This is what makes
   // backpressure kick in quickly rather than silently buffering an
@@ -289,47 +372,59 @@ async function startTranscoding() {
   captureInterval = setInterval(async ()=>{
     if(!ffmpegProc || !ffmpegStream || !page) return;
 
+    // A browser relaunch is already in progress — don't touch the page or
+    // trigger another one.
+    if (isRestartingBrowser) {
+      framesSkippedRestarting++;
+      return;
+    }
+
     // Don't start a new screenshot if the previous one hasn't finished yet.
-    // Overlapping screenshot calls were likely a big contributor to the
-    // browser hangs/restarts (and the "11 listeners" leak in the logs).
     if (isCapturing) {
       framesSkippedOverlap++;
       return;
     }
 
-    // Don't capture new frames if ffmpeg can't keep up. Without this, frames
-    // pile up in memory forever and playback drags further and further
-    // behind wall-clock time (the "racing clock" issue) instead of staying
-    // roughly live.
+    // Don't capture new frames if ffmpeg can't keep up.
     if (!canWrite) {
       framesSkippedBackpressure++;
       return;
     }
 
     isCapturing = true;
+    captureStartedAt = Date.now();
     try{
-      if(page.isClosed()){ isCapturing = false; await startBrowser('page was closed'); return; }
+      if(page.isClosed()){ isCapturing = false; captureStartedAt = null; await startBrowser('page was closed'); return; }
       // Updated 16:9 capture for version 1.6
       const screenshot = await page.screenshot({
         type:'png',
         clip:{ x:0, y:0, ...VIEW_DIMENSIONS } // crop top, right, and bottom based on your measurements
       });
+
+      const elapsedMs = Date.now() - captureStartedAt;
+      totalScreenshotMs += elapsedMs;
+      if (elapsedMs > maxScreenshotMs) maxScreenshotMs = elapsedMs;
+
       const ok = ffmpegStream.write(screenshot);
       framesWritten++;
       if (!ok) canWrite = false; // wait for 'drain' before writing again
 
-      // Every 5 minutes, log a quick health summary. Useful for confirming
-      // whether backpressure/overlap skips are happening in practice.
+      // Every 5 minutes, log a quick health summary including average
+      // screenshot duration, so we can watch it trend over the container's
+      // lifetime.
       if (framesWritten % (FRAME_RATE * 60 * 5) === 0) {
-        logTS(`Health check: framesWritten=${framesWritten}, skippedBackpressure=${framesSkippedBackpressure}, skippedOverlap=${framesSkippedOverlap}, browserRestarts=${browserRestartCount}`);
+        const avgMs = Math.round(totalScreenshotMs / framesWritten);
+        logTS(`Health check: framesWritten=${framesWritten}, avgScreenshotMs=${avgMs}, maxScreenshotMs=${maxScreenshotMs}, skippedBackpressure=${framesSkippedBackpressure}, skippedOverlap=${framesSkippedOverlap}, skippedRestarting=${framesSkippedRestarting}, browserRestarts=${browserRestartCount}, hangWarnings=${hangWarningsIssued}, hangForcedRestarts=${hangForcedRestarts}`);
       }
     } catch(err){
       console.warn('Capture error, retrying...', err.message);
       isCapturing = false;
+      captureStartedAt = null;
       await startBrowser(`capture error: ${err.message}`);
       return;
     }
     isCapturing = false;
+    captureStartedAt = null;
   },1000/FRAME_RATE);
 
   ffmpegProc.run();
@@ -338,6 +433,10 @@ async function startTranscoding() {
 async function stopTranscoding(){
   if(captureInterval) clearInterval(captureInterval);
   captureInterval=null; isStreamReady=false;
+  if(refreshTimer) clearInterval(refreshTimer);
+  refreshTimer=null;
+  if(watchdogInterval) clearInterval(watchdogInterval);
+  watchdogInterval=null;
   if(ffmpegProc) ffmpegProc.kill('SIGINT'); ffmpegProc=null;
   if(browser) await browser.close().catch(()=>{}); browser=null;
 }
@@ -358,12 +457,20 @@ app.get('/guide.xml',(req,res)=>{
 });
 
 app.get('/health',(req,res)=>{
+  const avgScreenshotMs = framesWritten > 0 ? Math.round(totalScreenshotMs / framesWritten) : 0;
+  const currentlyStuckMs = (isCapturing && captureStartedAt) ? (Date.now() - captureStartedAt) : 0;
   res.status(isStreamReady?200:503).json({
     ready:isStreamReady,
     browserRestarts: browserRestartCount,
     framesWritten,
     framesSkippedBackpressure,
-    framesSkippedOverlap
+    framesSkippedOverlap,
+    framesSkippedRestarting,
+    avgScreenshotMs,
+    maxScreenshotMs,
+    hangWarningsIssued,
+    hangForcedRestarts,
+    currentlyStuckMs
   });
 });
 
