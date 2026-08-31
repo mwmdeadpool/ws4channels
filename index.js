@@ -14,7 +14,7 @@ process.setMaxListeners(50);
 
 const app = express();
 
-const VERSION = '2.3'; // version 2.3 - dev-shm fix, screenshot timing + hang watchdog, restart lock, optional scheduled refresh
+const VERSION = '2.4'; // version 2.4 - ffmpeg-side logging (segment watchdog, progress tracking, stderr capture); removed capture-side hang watchdog (proven unnecessary)
 const ZIP_CODE = process.env.ZIP_CODE || '90210';
 const WS4KP_HOST = process.env.WS4KP_HOST || 'localhost';
 const WS4KP_PORT = process.env.WS4KP_PORT || '8080';
@@ -23,18 +23,19 @@ const WS4KP_URL = `http://${WS4KP_HOST}:${WS4KP_PORT}`;
 const PERMALINK_URL = process.env.PERMALINK_URL || null;
 const HLS_SETUP_DELAY = 2000;
 const FRAME_RATE = process.env.FRAME_RATE || 10;
+const HLS_SEGMENT_SECONDS = 2;
 
 // Optional proactive browser refresh. If set to a number > 0, the browser
 // will be relaunched on this interval (minutes) regardless of whether
 // anything has gone wrong. 0 = disabled (default).
 const BROWSER_REFRESH_MINUTES = parseInt(process.env.BROWSER_REFRESH_MINUTES || '0', 10);
 
-// Watchdog thresholds for a single page.screenshot() call.
-// WARN: log loudly that a capture is taking unusually long, but keep waiting.
-// FORCE_RESTART: give up on it entirely and relaunch the browser, since a
-// screenshot stuck this long is effectively a hang, not just slowness.
-const SCREENSHOT_WARN_MS = 3000;
-const SCREENSHOT_FORCE_RESTART_MS = 15000;
+// Segment freshness watchdog: HLS segments should land roughly every
+// HLS_SEGMENT_SECONDS. If we go this long without any output file's mtime
+// advancing, ffmpeg is stalled on the encode/write/mux side.
+const SEGMENT_STALL_WARN_MS = 8000;
+const SEGMENT_CHECK_INTERVAL_MS = 2000;
+const STDERR_BUFFER_LINES = 40;
 
 const OUTPUT_DIR = path.join(__dirname, 'output');
 const AUDIO_DIR = path.join(__dirname, 'music');
@@ -82,8 +83,8 @@ let ffmpegStream = null;
 let browser = null;
 let page = null;
 let captureInterval = null;
-let watchdogInterval = null;
 let refreshTimer = null;
+let segmentWatchdogInterval = null;
 let isStreamReady = false;
 
 // --- State for backpressure + overlap protection + restart diagnostics ---
@@ -96,13 +97,21 @@ let framesSkippedBackpressure = 0;
 let framesSkippedOverlap = 0;
 let framesSkippedRestarting = 0;
 
-// --- Screenshot timing + hang watchdog instrumentation ---
+// --- Screenshot timing (kept — cheap, and useful as a "capture side is
+// healthy" baseline now that we've ruled it out as the freeze cause) ---
 let totalScreenshotMs = 0;
 let maxScreenshotMs = 0;
-let captureStartedAt = null;   // timestamp of the currently in-flight screenshot, or null
-let hangWarningsIssued = 0;    // how many times a single screenshot exceeded SCREENSHOT_WARN_MS
-let hangForcedRestarts = 0;    // how many times a single screenshot exceeded SCREENSHOT_FORCE_RESTART_MS
-let lastHangWarnLoggedAt = 0;  // avoid spamming the log every watchdog tick for the same stuck call
+let captureStartedAt = null; // timestamp of the currently in-flight screenshot, or null
+
+// --- ffmpeg-side instrumentation (new) ---
+let stderrBuffer = [];              // rolling buffer of the last N ffmpeg stderr lines
+let lastProgress = null;            // most recent fluent-ffmpeg 'progress' payload
+let lastProgressAt = null;          // when we last received a progress event
+let lastSegmentMtimeMs = null;      // newest mtime seen among output files
+let lastSegmentChangeAt = null;     // wall-clock time that mtime last advanced
+let segmentStallActive = false;     // whether we're currently in a detected stall
+let segmentStallWarningsIssued = 0; // how many distinct stall episodes we've logged
+let lastStallDumpAt = 0;            // throttles repeated stderr dumps during one long stall
 
 const waitFor = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -211,12 +220,6 @@ async function startBrowser(reason = 'initial startup') {
         '--disable-infobars',
         '--ignore-certificate-errors',
         '--window-size=1280,720',
-        // These four are common fixes for headless Chrome intermittently
-        // hanging/stalling inside Docker containers, most notably the tiny
-        // (64MB) default /dev/shm size. --disable-dev-shm-usage makes
-        // Chrome use /tmp instead, which is the leading suspect for the
-        // "screenshot calls hang for seconds despite the page rendering
-        // fine" pattern we're seeing.
         '--disable-dev-shm-usage',
         '--disable-gpu',
         '--disable-software-rasterizer',
@@ -314,37 +317,75 @@ function scheduleBrowserRefresh() {
   }, BROWSER_REFRESH_MINUTES * 60 * 1000);
 }
 
-function startWatchdog() {
-  if (watchdogInterval) clearInterval(watchdogInterval);
-  // Checks once a second whether the currently in-flight screenshot call
-  // has been running suspiciously long. This is the piece that lets us see
-  // a hang WHILE it's happening, rather than only after it eventually
-  // resolves (if it ever does).
-  watchdogInterval = setInterval(() => {
-    if (!isCapturing || !captureStartedAt) return;
-    const inFlightMs = Date.now() - captureStartedAt;
+function dumpFfmpegDiagnostics(gapMs) {
+  logTS(`FFMPEG STALL WARNING: no new HLS segment/file activity in ${gapMs}ms (segments should land roughly every ${HLS_SEGMENT_SECONDS * 1000}ms)`);
 
-    if (inFlightMs > SCREENSHOT_FORCE_RESTART_MS) {
-      hangForcedRestarts++;
-      logTS(`WATCHDOG: screenshot has been stuck for ${inFlightMs}ms (over the ${SCREENSHOT_FORCE_RESTART_MS}ms limit) — forcing a browser restart`);
-      captureStartedAt = null;
-      startBrowser(`screenshot hang timeout (${inFlightMs}ms)`);
+  if (lastProgress) {
+    const sinceProgress = lastProgressAt ? (Date.now() - lastProgressAt) : null;
+    logTS(`Last ffmpeg progress event (${sinceProgress}ms ago): frames=${lastProgress.frames}, currentFps=${lastProgress.currentFps}, currentKbps=${lastProgress.currentKbps}, timemark=${lastProgress.timemark}`);
+  } else {
+    logTS('No ffmpeg progress events received yet this session');
+  }
+
+  if (stderrBuffer.length === 0) {
+    logTS('(no ffmpeg stderr output captured yet)');
+  } else {
+    logTS(`Last ${stderrBuffer.length} ffmpeg stderr line(s):`);
+    stderrBuffer.forEach(line => console.log(`  ffmpeg: ${line}`));
+  }
+}
+
+function startSegmentWatchdog() {
+  if (segmentWatchdogInterval) clearInterval(segmentWatchdogInterval);
+  lastSegmentMtimeMs = null;
+  lastSegmentChangeAt = Date.now();
+  segmentStallActive = false;
+
+  segmentWatchdogInterval = setInterval(() => {
+    let files;
+    try {
+      files = fs.readdirSync(OUTPUT_DIR);
+    } catch {
+      return; // output dir momentarily unavailable, e.g. during a restart
+    }
+
+    let newestMtime = 0;
+    for (const f of files) {
+      if (!f.endsWith('.ts') && !f.endsWith('.m3u8')) continue;
+      try {
+        const stat = fs.statSync(path.join(OUTPUT_DIR, f));
+        if (stat.mtimeMs > newestMtime) newestMtime = stat.mtimeMs;
+      } catch {}
+    }
+
+    if (newestMtime > 0 && (lastSegmentMtimeMs === null || newestMtime > lastSegmentMtimeMs)) {
+      lastSegmentMtimeMs = newestMtime;
+      lastSegmentChangeAt = Date.now();
+      if (segmentStallActive) {
+        logTS('FFMPEG STALL RECOVERED: new segment activity detected, output is flowing again');
+        segmentStallActive = false;
+      }
       return;
     }
 
-    if (inFlightMs > SCREENSHOT_WARN_MS && Date.now() - lastHangWarnLoggedAt > 1000) {
-      lastHangWarnLoggedAt = Date.now();
-      hangWarningsIssued++;
-      logTS(`WATCHDOG WARNING: screenshot has been in-flight for ${inFlightMs}ms so far (frame #${framesWritten})`);
+    const gapMs = Date.now() - lastSegmentChangeAt;
+    if (gapMs > SEGMENT_STALL_WARN_MS) {
+      // Log the initial detection immediately, then only re-dump every 5s
+      // while the same stall continues, so a long stall doesn't spam the log.
+      if (!segmentStallActive || Date.now() - lastStallDumpAt > 5000) {
+        segmentStallActive = true;
+        lastStallDumpAt = Date.now();
+        segmentStallWarningsIssued++;
+        dumpFfmpegDiagnostics(gapMs);
+      }
     }
-  }, 1000);
+  }, SEGMENT_CHECK_INTERVAL_MS);
 }
 
 async function startTranscoding() {
   await startBrowser('initial startup');
   createAudioInputFile();
   scheduleBrowserRefresh();
-  startWatchdog();
 
   // Give the PassThrough a modest, explicit buffer size. This is what makes
   // backpressure kick in quickly rather than silently buffering an
@@ -354,7 +395,9 @@ async function startTranscoding() {
     canWrite = true;
   });
 
-  const HLS_SEGMENT_SECONDS = 2;
+  stderrBuffer = [];
+  lastProgress = null;
+  lastProgressAt = null;
 
   ffmpegProc = ffmpeg()
     .input(ffmpegStream)
@@ -365,9 +408,19 @@ async function startTranscoding() {
     .complexFilter([`[0:v]scale=${VIEW_DIMENSIONS.width}:${VIEW_DIMENSIONS.height}[v]`,'[1:a]volume=0.5[a]'])
     .outputOptions(['-map [v]','-map [a]','-c:v libx264','-c:a aac','-b:a 128k','-preset ultrafast',`-g ${FRAME_RATE * HLS_SEGMENT_SECONDS}`,'-b:v 1000k','-f hls',`-hls_time ${HLS_SEGMENT_SECONDS}`,'-hls_list_size 2','-hls_flags delete_segments'])
     .output(HLS_FILE)
-    .on('start',()=>{ logTS(`Started FFmpeg - Version ${VERSION}`); setTimeout(()=>isStreamReady=true,HLS_SETUP_DELAY); })
+    .on('start',(cmd)=>{ logTS(`Started FFmpeg - Version ${VERSION}`); setTimeout(()=>isStreamReady=true,HLS_SETUP_DELAY); })
+    .on('stderr', line => {
+      stderrBuffer.push(line);
+      if (stderrBuffer.length > STDERR_BUFFER_LINES) stderrBuffer.shift();
+    })
+    .on('progress', p => {
+      lastProgress = p;
+      lastProgressAt = Date.now();
+    })
     .on('error', async err=>{ logTS(`FFmpeg error: ${err.message}`); await stopTranscoding(); startTranscoding(); })
     .on('end',()=>{ ffmpegProc=null; ffmpegStream=null; isStreamReady=false; });
+
+  startSegmentWatchdog();
 
   captureInterval = setInterval(async ()=>{
     if(!ffmpegProc || !ffmpegStream || !page) return;
@@ -409,12 +462,11 @@ async function startTranscoding() {
       framesWritten++;
       if (!ok) canWrite = false; // wait for 'drain' before writing again
 
-      // Every 5 minutes, log a quick health summary including average
-      // screenshot duration, so we can watch it trend over the container's
-      // lifetime.
+      // Every 5 minutes, log a quick health summary.
       if (framesWritten % (FRAME_RATE * 60 * 5) === 0) {
         const avgMs = Math.round(totalScreenshotMs / framesWritten);
-        logTS(`Health check: framesWritten=${framesWritten}, avgScreenshotMs=${avgMs}, maxScreenshotMs=${maxScreenshotMs}, skippedBackpressure=${framesSkippedBackpressure}, skippedOverlap=${framesSkippedOverlap}, skippedRestarting=${framesSkippedRestarting}, browserRestarts=${browserRestartCount}, hangWarnings=${hangWarningsIssued}, hangForcedRestarts=${hangForcedRestarts}`);
+        const sinceProgress = lastProgressAt ? (Date.now() - lastProgressAt) : null;
+        logTS(`Health check: framesWritten=${framesWritten}, avgScreenshotMs=${avgMs}, maxScreenshotMs=${maxScreenshotMs}, skippedBackpressure=${framesSkippedBackpressure}, skippedOverlap=${framesSkippedOverlap}, skippedRestarting=${framesSkippedRestarting}, browserRestarts=${browserRestartCount}, segmentStallWarnings=${segmentStallWarningsIssued}, msSinceLastFfmpegProgress=${sinceProgress}`);
       }
     } catch(err){
       console.warn('Capture error, retrying...', err.message);
@@ -435,8 +487,8 @@ async function stopTranscoding(){
   captureInterval=null; isStreamReady=false;
   if(refreshTimer) clearInterval(refreshTimer);
   refreshTimer=null;
-  if(watchdogInterval) clearInterval(watchdogInterval);
-  watchdogInterval=null;
+  if(segmentWatchdogInterval) clearInterval(segmentWatchdogInterval);
+  segmentWatchdogInterval=null;
   if(ffmpegProc) ffmpegProc.kill('SIGINT'); ffmpegProc=null;
   if(browser) await browser.close().catch(()=>{}); browser=null;
 }
@@ -459,6 +511,9 @@ app.get('/guide.xml',(req,res)=>{
 app.get('/health',(req,res)=>{
   const avgScreenshotMs = framesWritten > 0 ? Math.round(totalScreenshotMs / framesWritten) : 0;
   const currentlyStuckMs = (isCapturing && captureStartedAt) ? (Date.now() - captureStartedAt) : 0;
+  const msSinceLastSegmentChange = lastSegmentChangeAt ? (Date.now() - lastSegmentChangeAt) : null;
+  const msSinceLastFfmpegProgress = lastProgressAt ? (Date.now() - lastProgressAt) : null;
+
   res.status(isStreamReady?200:503).json({
     ready:isStreamReady,
     browserRestarts: browserRestartCount,
@@ -468,9 +523,12 @@ app.get('/health',(req,res)=>{
     framesSkippedRestarting,
     avgScreenshotMs,
     maxScreenshotMs,
-    hangWarningsIssued,
-    hangForcedRestarts,
-    currentlyStuckMs
+    currentlyStuckMs,
+    segmentStallWarningsIssued,
+    segmentStallActive,
+    msSinceLastSegmentChange,
+    msSinceLastFfmpegProgress,
+    lastFfmpegTimemark: lastProgress ? lastProgress.timemark : null
   });
 });
 

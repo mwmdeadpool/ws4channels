@@ -1,5 +1,7 @@
 # Latest Update
 
+08/31/2026 version2.4 - Added ffmpeg-side logging (segment watchdog, progress tracking, stderr capture); removed capture-side hang watchdog (proven unnecessary).
+
 08/16/2026 version2.3 Added more logging.  Added another attempt to fix rare stream being more than 3 minutes behind and racing catchup. 
 
 08/10/2026 version2.2  Added another attempt to fix rare stream being more than 3 minutes behind and racing catchup.  Updates so regional maps and radar are drawn full-screen and properly centered on the user's location.
