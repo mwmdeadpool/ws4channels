@@ -25,6 +25,14 @@ const HLS_SETUP_DELAY = 2000;
 const FRAME_RATE = process.env.FRAME_RATE || 10;
 const HLS_SEGMENT_SECONDS = 2;
 
+// Number of segments kept in the live playlist. This is the player's entire
+// buffer: at the old value of 2 the client had only HLS_SEGMENT_SECONDS * 2 = 4
+// seconds of runway, so any capture or encode hiccup drained the playlist before
+// the next segment landed and playback stalled. 6 segments (12s) is the usual
+// live-HLS range and absorbs a spike without a visible freeze. Raising it costs
+// a little latency; lower it if you would rather be closer to live.
+const HLS_LIST_SIZE = parseInt(process.env.HLS_LIST_SIZE || '6', 10);
+
 // --- Hardware-accelerated encoding -------------------------------------------
 // HWACCEL=nvenc moves H.264 encoding onto an NVIDIA GPU (h264_nvenc). The
 // default 'none' leaves the original libx264 CPU path unchanged.
@@ -497,7 +505,7 @@ async function startTranscoding() {
     .input(path.join(__dirname,'audio_list.txt'))
     .inputOptions(['-f concat','-safe 0','-stream_loop -1','-vcodec png'])
     .complexFilter([videoFilter(),'[1:a]volume=0.5[a]'])
-    .outputOptions(['-map [v]','-map [a]','-c:a aac','-b:a 128k',...videoOutputOptions(),'-f hls',`-hls_time ${HLS_SEGMENT_SECONDS}`,'-hls_list_size 2','-hls_flags delete_segments'])
+    .outputOptions(['-map [v]','-map [a]','-c:a aac','-b:a 128k',...videoOutputOptions(),'-f hls',`-hls_time ${HLS_SEGMENT_SECONDS}`,`-hls_list_size ${HLS_LIST_SIZE}`,'-hls_flags delete_segments'])
     .output(HLS_FILE)
     .on('start',(cmd)=>{ logTS(`Started FFmpeg - Version ${VERSION} - video encoder ${activeEncoder}`); setTimeout(()=>isStreamReady=true,HLS_SETUP_DELAY); })
     .on('stderr', line => {
