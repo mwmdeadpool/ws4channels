@@ -118,9 +118,116 @@ Environment Variables
 	
 	•  VIEW_MODE: One of: `standard`, `wide` (default), `wide-enhanced` or `portrait-enhanced`. These values correspond to the modes available in ws4kp, with the last two only available in ws4kp v7.0+. Video sizes are 640x480, 1280x720 or 720x1280 to match.
 
+	•  HLS_LIST_SIZE: Segments kept in the live playlist (default: 6, i.e. 12 seconds of buffer). This is the player's entire runway. The previous hard-coded value of 2 gave clients only 4 seconds, so a single slow frame capture could drain the playlist and stall playback. Lower it to sit closer to live, raise it if playback still stutters.
+
+## Playback stutters or freezes
+
+Freezing is usually starvation, not encoding. Check the health check line in the
+container logs:
+
+```
+Health check: framesWritten=21000, avgScreenshotMs=167, maxScreenshotMs=783,
+skippedOverlap=25614, segmentStallWarnings=2
+```
+
+`avgScreenshotMs` needs to stay under the frame budget — `1000 / FRAME_RATE` ms,
+so 100ms at the default 10fps. If it is over, or `maxScreenshotMs` spikes into
+the hundreds, Puppeteer cannot produce frames fast enough and ffmpeg is left with
+gaps. `skippedOverlap` climbing faster than `framesWritten` confirms it: those
+are captures abandoned because the previous one had not finished.
+
+The usual cause is a CPU limit on the container. Chrome, not ffmpeg, is the
+expensive part — roughly 85% of the load — so a 1-CPU cap starves the capture
+loop. Check for throttling on the host:
+
+```
+grep -E 'nr_periods|nr_throttled' /sys/fs/cgroup/docker/$(docker inspect \
+  ws4channels --format '{{.Id}}')/cpu.stat
+```
+
+Any meaningful ratio of `nr_throttled` to `nr_periods` means the container is
+being held back. Raise the limit (`docker update --cpus=6 ws4channels`, or the
+equivalent in your template) and re-check. Note that `docker update` changes the
+running container only — update the template too, or the old limit returns.
+
+Hardware encoding does not help here. The H.264 encode is a small fraction of the
+work, so `HWACCEL=nvenc` will not fix stuttering caused by frame starvation.
+
 ## Hardware Acceleration, ARM Multi Arch Support
 
-Currently hardware encoding and Multi Arch are not supported. 
+NVIDIA hardware encoding (NVENC) is supported. Multi Arch is not.
+
+Set `HWACCEL=nvenc` and give the container access to a GPU. Encoding moves from
+`libx264` to `h264_nvenc`, which frees up most of the CPU the stream was using.
+
+No custom ffmpeg build is required — the `h264_nvenc` encoder is already present
+in the Debian ffmpeg package the image installs. What the container needs is the
+NVIDIA Container Toolkit on the host, and the `video` driver capability, which is
+what causes the driver's encode libraries to be injected at runtime. The image
+sets `NVIDIA_DRIVER_CAPABILITIES=compute,utility,video` for you.
+
+Docker run:
+
+```
+docker run -d --name ws4channels \
+  --runtime=nvidia \
+  -p 9798:9798 \
+  -e HWACCEL=nvenc \
+  -e ZIP_CODE=63101 \
+  -e WS4KP_HOST=192.168.1.152 \
+  ws4channels:latest
+```
+
+Docker compose:
+
+```yaml
+services:
+  ws4channels:
+    image: ws4channels:latest
+    runtime: nvidia
+    environment:
+      - HWACCEL=nvenc
+      - ZIP_CODE=63101
+```
+
+On Unraid, add `--runtime=nvidia` to *Extra Parameters* and set `HWACCEL=nvenc`
+as a variable.
+
+### Falling back safely
+
+`HWACCEL=nvenc` is a request, not a guarantee. At startup the app encodes one
+throwaway frame to check the GPU is genuinely usable, and if it is not, it logs
+the reason and continues on `libx264`. This matters because a container started
+without GPU access still reports `h264_nvenc` as an available encoder — the
+encoder is compiled in whether or not hardware is present — so the failure would
+otherwise only appear when the real pipeline starts, and the existing error
+handler restarts transcoding on failure, turning it into a restart loop.
+
+Which encoder was chosen is logged on every ffmpeg start:
+
+```
+Started FFmpeg - Version 2.4 - video encoder h264_nvenc
+```
+
+To confirm the GPU is actually working, run `nvidia-smi` on the host while the
+stream is live and look for a non-zero encoder session count.
+
+### NVENC tuning
+
+	•  `HWACCEL`: `none` (default) or `nvenc`
+
+	•  `NVENC_PRESET`: `p1` (fastest) through `p7` (best quality), default `p4`
+
+	•  `NVENC_TUNE`: `hq`, `ll` (low latency, default) or `ull` (ultra low latency)
+
+	•  `NVENC_RC`: rate control, `cbr` (default), `vbr` or `constqp`
+
+	•  `VIDEO_BITRATE`: video bitrate, default `1000k` (applies to both encoders)
+
+Only the encode is offloaded. Frames arrive as PNGs from Puppeteer, so there is
+no video decode to accelerate, and the scale filter is deliberately left in
+software — at this resolution and frame rate it costs almost nothing, and moving
+it to the GPU would add a `hwupload_cuda` round trip for no benefit.
 
 
 ### Accessing the Stream

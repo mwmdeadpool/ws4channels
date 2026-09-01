@@ -25,6 +25,39 @@ const HLS_SETUP_DELAY = 2000;
 const FRAME_RATE = process.env.FRAME_RATE || 10;
 const HLS_SEGMENT_SECONDS = 2;
 
+// Number of segments kept in the live playlist. This is the player's entire
+// buffer: at the old value of 2 the client had only HLS_SEGMENT_SECONDS * 2 = 4
+// seconds of runway, so any capture or encode hiccup drained the playlist before
+// the next segment landed and playback stalled. 6 segments (12s) is the usual
+// live-HLS range and absorbs a spike without a visible freeze. Raising it costs
+// a little latency; lower it if you would rather be closer to live.
+const HLS_LIST_SIZE = parseInt(process.env.HLS_LIST_SIZE || '6', 10);
+
+// --- Hardware-accelerated encoding -------------------------------------------
+// HWACCEL=nvenc moves H.264 encoding onto an NVIDIA GPU (h264_nvenc). The
+// default 'none' leaves the original libx264 CPU path unchanged.
+//
+// Only the encode is offloaded. Frames arrive as PNGs from Puppeteer, so there
+// is no video decode to accelerate, and the scale filter deliberately stays in
+// software: at this resolution and frame rate it is nearly free, and keeping it
+// there avoids a hwupload_cuda round trip that would add latency for no gain.
+//
+// Requires the container to be started with GPU access -- see README.
+const HWACCEL = (process.env.HWACCEL || 'none').toLowerCase();
+const VIDEO_BITRATE = process.env.VIDEO_BITRATE || '1000k';
+// nvenc presets run p1 (fastest) .. p7 (best quality); p4 is the driver default.
+const NVENC_PRESET = process.env.NVENC_PRESET || 'p4';
+// Tuning: hq | ll (low latency) | ull (ultra low latency). Live HLS wants ll.
+const NVENC_TUNE = process.env.NVENC_TUNE || 'll';
+// cbr suits HLS: predictable segment sizes keep the playlist well behaved.
+const NVENC_RC = process.env.NVENC_RC || 'cbr';
+
+// Resolved at startup by probeEncoder(). Never trust HWACCEL alone: a container
+// started without GPU access will happily set HWACCEL=nvenc and then crash-loop
+// on every ffmpeg spawn, and the existing error handler restarts transcoding on
+// failure, so an unusable encoder becomes an infinite restart loop.
+let activeEncoder = 'libx264';
+
 // Optional proactive browser refresh. If set to a number > 0, the browser
 // will be relaunched on this interval (minutes) regardless of whether
 // anything has gone wrong. 0 = disabled (default).
@@ -382,6 +415,72 @@ function startSegmentWatchdog() {
   }, SEGMENT_CHECK_INTERVAL_MS);
 }
 
+// Encode one throwaway frame to prove the requested encoder actually works
+// before committing the real pipeline to it. Checking that h264_nvenc is listed
+// in `-encoders` is not enough: the encoder is compiled into Debian's ffmpeg
+// whether or not a GPU is present, so the listing succeeds on a container with
+// no GPU access and the failure only surfaces later, on every restart.
+function probeEncoder() {
+  return new Promise(resolve => {
+    if (HWACCEL !== 'nvenc') {
+      if (HWACCEL !== 'none') logTS(`Unknown HWACCEL '${HWACCEL}', falling back to libx264`);
+      return resolve('libx264');
+    }
+    const { spawn } = require('child_process');
+    const probe = spawn('ffmpeg', [
+      '-hide_banner', '-loglevel', 'error',
+      '-f', 'lavfi', '-i', `nullsrc=s=${VIEW_DIMENSIONS.width}x${VIEW_DIMENSIONS.height}:d=0.1`,
+      '-c:v', 'h264_nvenc', '-preset', NVENC_PRESET,
+      '-frames:v', '1', '-f', 'null', '-',
+    ]);
+    let stderr = '';
+    probe.stderr.on('data', d => { stderr += d.toString(); });
+    const timer = setTimeout(() => { probe.kill('SIGKILL'); }, 15000);
+    probe.on('error', err => {
+      clearTimeout(timer);
+      logTS(`NVENC probe could not run ffmpeg (${err.message}); using libx264`);
+      resolve('libx264');
+    });
+    probe.on('close', code => {
+      clearTimeout(timer);
+      if (code === 0) {
+        logTS(`NVENC probe OK - encoding on h264_nvenc (preset ${NVENC_PRESET}, tune ${NVENC_TUNE}, rc ${NVENC_RC})`);
+        return resolve('h264_nvenc');
+      }
+      logTS('NVENC requested but unusable - falling back to libx264. Is the container started with GPU access?');
+      stderr.trim().split('\n').filter(Boolean).slice(-4).forEach(l => logTS(`  nvenc probe: ${l}`));
+      resolve('libx264');
+    });
+  });
+}
+
+// Video filter chain. nvenc accepts system-memory frames directly, but the PNG
+// input arrives as RGB and yuv420p is what players expect from HLS, so the
+// conversion is made explicit on the GPU path. The libx264 path is left exactly
+// as it was (x264 performs the same conversion implicitly).
+function videoFilter() {
+  const scale = `[0:v]scale=${VIEW_DIMENSIONS.width}:${VIEW_DIMENSIONS.height}`;
+  return activeEncoder === 'h264_nvenc' ? `${scale},format=yuv420p[v]` : `${scale}[v]`;
+}
+
+function videoOutputOptions() {
+  const gop = FRAME_RATE * HLS_SEGMENT_SECONDS;
+  if (activeEncoder === 'h264_nvenc') {
+    return [
+      '-c:v h264_nvenc',
+      `-preset ${NVENC_PRESET}`,
+      `-tune ${NVENC_TUNE}`,
+      `-rc ${NVENC_RC}`,
+      '-profile:v high',
+      `-b:v ${VIDEO_BITRATE}`,
+      `-maxrate ${VIDEO_BITRATE}`,
+      `-bufsize ${VIDEO_BITRATE}`,
+      `-g ${gop}`,
+    ];
+  }
+  return ['-c:v libx264', '-preset ultrafast', `-g ${gop}`, `-b:v ${VIDEO_BITRATE}`];
+}
+
 async function startTranscoding() {
   await startBrowser('initial startup');
   createAudioInputFile();
@@ -405,10 +504,10 @@ async function startTranscoding() {
     .inputOptions([`-framerate ${FRAME_RATE}`])
     .input(path.join(__dirname,'audio_list.txt'))
     .inputOptions(['-f concat','-safe 0','-stream_loop -1','-vcodec png'])
-    .complexFilter([`[0:v]scale=${VIEW_DIMENSIONS.width}:${VIEW_DIMENSIONS.height}[v]`,'[1:a]volume=0.5[a]'])
-    .outputOptions(['-map [v]','-map [a]','-c:v libx264','-c:a aac','-b:a 128k','-preset ultrafast',`-g ${FRAME_RATE * HLS_SEGMENT_SECONDS}`,'-b:v 1000k','-f hls',`-hls_time ${HLS_SEGMENT_SECONDS}`,'-hls_list_size 2','-hls_flags delete_segments'])
+    .complexFilter([videoFilter(),'[1:a]volume=0.5[a]'])
+    .outputOptions(['-map [v]','-map [a]','-c:a aac','-b:a 128k',...videoOutputOptions(),'-f hls',`-hls_time ${HLS_SEGMENT_SECONDS}`,`-hls_list_size ${HLS_LIST_SIZE}`,'-hls_flags delete_segments'])
     .output(HLS_FILE)
-    .on('start',(cmd)=>{ logTS(`Started FFmpeg - Version ${VERSION}`); setTimeout(()=>isStreamReady=true,HLS_SETUP_DELAY); })
+    .on('start',(cmd)=>{ logTS(`Started FFmpeg - Version ${VERSION} - video encoder ${activeEncoder}`); setTimeout(()=>isStreamReady=true,HLS_SETUP_DELAY); })
     .on('stderr', line => {
       stderrBuffer.push(line);
       if (stderrBuffer.length > STDERR_BUFFER_LINES) stderrBuffer.shift();
@@ -537,6 +636,10 @@ console.log(`Version ${VERSION} | Running with ${cpus} CPU cores, ${memoryMB}MB 
 
 app.listen(STREAM_PORT, async ()=>{
   console.log(`Streaming server running on port ${STREAM_PORT}`);
+  // Probe once at boot, not per restart: startTranscoding() is re-entered by the
+  // ffmpeg error handler, and re-probing there would add a GPU test to every
+  // recovery attempt.
+  activeEncoder = await probeEncoder();
   await startTranscoding();
 });
 
