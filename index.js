@@ -14,7 +14,7 @@ process.setMaxListeners(50);
 
 const app = express();
 
-const VERSION = '2.4'; // version 2.4 - ffmpeg-side logging (segment watchdog, progress tracking, stderr capture); removed capture-side hang watchdog (proven unnecessary)
+const VERSION = '2.5'; // version 2.5 - JPEG capture (PNG was the frame-rate ceiling) + wall-clock input timestamps so the stream can never advance slower than real time
 const ZIP_CODE = process.env.ZIP_CODE || '90210';
 const WS4KP_HOST = process.env.WS4KP_HOST || 'localhost';
 const WS4KP_PORT = process.env.WS4KP_PORT || '8080';
@@ -44,7 +44,41 @@ const HLS_LIST_SIZE = parseInt(process.env.HLS_LIST_SIZE || '6', 10);
 //
 // Requires the container to be started with GPU access -- see README.
 const HWACCEL = (process.env.HWACCEL || 'none').toLowerCase();
-const VIDEO_BITRATE = process.env.VIDEO_BITRATE || '1000k';
+const VIDEO_BITRATE = process.env.VIDEO_BITRATE || '3000k';
+
+// 'ultrafast' was chosen when this container was capped at a single CPU. With
+// six cores and one 1280x720 10fps stream the encoder is nowhere near the
+// budget -- measured 114% of a 600% allowance, and encode is a small slice of
+// that -- while ultrafast spends a lot of bitrate for nothing. 'veryfast' is a
+// large quality-per-bit gain paid for with CPU that is already sitting idle.
+const X264_PRESET = process.env.X264_PRESET || 'veryfast';
+
+// --- Capture format ----------------------------------------------------------
+// This is the whole frame-rate budget. Chromium encodes a 1280x720 PNG in
+// ~130ms; the capture loop ticks every 1000/FRAME_RATE ms and skips any tick
+// whose predecessor is still running, so at FRAME_RATE=10 (a 100ms tick) every
+// other tick was lost and the pipe received a hard 5fps -- while ffmpeg was
+// still told the input was 10fps. The HLS timeline then advanced at half real
+// time and every client rebuffered.
+//
+// Measured 2026-09-03 before this change: avgScreenshotMs 132, framesWritten
+// +3000 per 594s (5.05fps), skippedOverlap +2936 over the same window, playlist
+// emitting ~10s of content per ~16s of wall clock.
+//
+// JPEG is several times cheaper to encode and visually indistinguishable at q90
+// for this content. Set CAPTURE_FORMAT=png to go back.
+const CAPTURE_FORMAT = (process.env.CAPTURE_FORMAT || 'jpeg').toLowerCase();
+const CAPTURE_QUALITY = parseInt(process.env.CAPTURE_QUALITY || '90', 10);
+
+// --- Input timestamps --------------------------------------------------------
+// 'wallclock' stamps each frame with its arrival time and lets the output
+// resample to CFR, so a slow capture makes motion choppier but keeps playback at
+// real time. 'nominal' is the old behaviour -- assume frames arrive at exactly
+// FRAME_RATE, which stretches the timeline whenever they don't. Choppy is
+// survivable; slower than real time is not, because the player runs out of
+// playlist and stalls. This is the belt to JPEG's braces: it bounds the damage
+// from any future capture slowdown instead of turning it back into a stall.
+const TIMESTAMP_MODE = (process.env.TIMESTAMP_MODE || 'wallclock').toLowerCase();
 // nvenc presets run p1 (fastest) .. p7 (best quality); p4 is the driver default.
 const NVENC_PRESET = process.env.NVENC_PRESET || 'p4';
 // Tuning: hq | ll (low latency) | ull (ultra low latency). Live HLS wants ll.
@@ -478,7 +512,17 @@ function videoOutputOptions() {
       `-g ${gop}`,
     ];
   }
-  return ['-c:v libx264', '-preset ultrafast', `-g ${gop}`, `-b:v ${VIDEO_BITRATE}`];
+  return ['-c:v libx264', `-preset ${X264_PRESET}`, `-g ${gop}`, `-b:v ${VIDEO_BITRATE}`];
+}
+
+// Wall-clock input timestamps make the pipe variable-rate, so the output has to
+// be pinned back to CFR explicitly -- otherwise a dropped capture becomes a
+// variable-rate HLS segment and players handle those badly. Duplicating a frame
+// costs nothing at this bitrate and keeps the timeline honest.
+function frameRateOutputOptions() {
+  return TIMESTAMP_MODE === 'wallclock'
+    ? [`-r ${FRAME_RATE}`, '-fps_mode cfr']
+    : [];
 }
 
 async function startTranscoding() {
@@ -501,11 +545,18 @@ async function startTranscoding() {
   ffmpegProc = ffmpeg()
     .input(ffmpegStream)
     .inputFormat('image2pipe')
-    .inputOptions([`-framerate ${FRAME_RATE}`])
+    .inputOptions(
+      TIMESTAMP_MODE === 'wallclock'
+        // -framerate stays as the nominal hint for anything that asks before a
+        // second frame has arrived; the wallclock stamps are what actually
+        // drive the timeline.
+        ? ['-use_wallclock_as_timestamps 1', `-framerate ${FRAME_RATE}`]
+        : [`-framerate ${FRAME_RATE}`]
+    )
     .input(path.join(__dirname,'audio_list.txt'))
     .inputOptions(['-f concat','-safe 0','-stream_loop -1','-vcodec png'])
     .complexFilter([videoFilter(),'[1:a]volume=0.5[a]'])
-    .outputOptions(['-map [v]','-map [a]','-c:a aac','-b:a 128k',...videoOutputOptions(),'-f hls',`-hls_time ${HLS_SEGMENT_SECONDS}`,`-hls_list_size ${HLS_LIST_SIZE}`,'-hls_flags delete_segments'])
+    .outputOptions(['-map [v]','-map [a]','-c:a aac','-b:a 128k',...videoOutputOptions(),...frameRateOutputOptions(),'-f hls',`-hls_time ${HLS_SEGMENT_SECONDS}`,`-hls_list_size ${HLS_LIST_SIZE}`,'-hls_flags delete_segments'])
     .output(HLS_FILE)
     .on('start',(cmd)=>{ logTS(`Started FFmpeg - Version ${VERSION} - video encoder ${activeEncoder}`); setTimeout(()=>isStreamReady=true,HLS_SETUP_DELAY); })
     .on('stderr', line => {
@@ -549,8 +600,14 @@ async function startTranscoding() {
       if(page.isClosed()){ isCapturing = false; captureStartedAt = null; await startBrowser('page was closed'); return; }
       // Updated 16:9 capture for version 1.6
       const screenshot = await page.screenshot({
-        type:'png',
-        clip:{ x:0, y:0, ...VIEW_DIMENSIONS } // crop top, right, and bottom based on your measurements
+        type: CAPTURE_FORMAT,
+        // quality is only valid for jpeg/webp -- passing it with png throws.
+        ...(CAPTURE_FORMAT === 'png' ? {} : { quality: CAPTURE_QUALITY }),
+        clip:{ x:0, y:0, ...VIEW_DIMENSIONS }, // crop top, right, and bottom based on your measurements
+        // The clip matches the viewport exactly, so there is nothing beyond it
+        // to capture; letting Puppeteer resize for an off-screen area is pure
+        // cost on every single frame.
+        captureBeyondViewport: false
       });
 
       const elapsedMs = Date.now() - captureStartedAt;
@@ -633,6 +690,7 @@ app.get('/health',(req,res)=>{
 
 const { cpus, memoryMB } = getContainerLimits();
 console.log(`Version ${VERSION} | Running with ${cpus} CPU cores, ${memoryMB}MB RAM`);
+console.log(`Capture: ${CAPTURE_FORMAT}${CAPTURE_FORMAT === 'png' ? '' : ` q${CAPTURE_QUALITY}`} @ ${FRAME_RATE}fps | timestamps: ${TIMESTAMP_MODE} | bitrate: ${VIDEO_BITRATE} | x264 preset: ${X264_PRESET}`);
 
 app.listen(STREAM_PORT, async ()=>{
   console.log(`Streaming server running on port ${STREAM_PORT}`);
