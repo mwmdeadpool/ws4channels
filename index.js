@@ -14,7 +14,7 @@ process.setMaxListeners(50);
 
 const app = express();
 
-const VERSION = '2.5'; // version 2.5 - JPEG capture (PNG was the frame-rate ceiling) + wall-clock input timestamps so the stream can never advance slower than real time
+const VERSION = '2.6'; // version 2.6 - honour X-Forwarded-Proto so playlist.m3u and guide.xml emit correct URLs behind a TLS reverse proxy
 const ZIP_CODE = process.env.ZIP_CODE || '90210';
 const WS4KP_HOST = process.env.WS4KP_HOST || 'localhost';
 const WS4KP_PORT = process.env.WS4KP_PORT || '8080';
@@ -241,9 +241,8 @@ function createAudioInputFile() {
   // and that the default files (listed above) are used if no MP3s are found.
 }
 
-function generateXMLTV(host) {
+function generateXMLTV(baseUrl) {
   const now = new Date();
-  const baseUrl = `http://${host}`;
   let xml = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE tv SYSTEM "xmltv.dtd">
 <tv>
@@ -649,9 +648,19 @@ async function stopTranscoding(){
   if(browser) await browser.close().catch(()=>{}); browser=null;
 }
 
-app.get('/playlist.m3u',(req,res)=>{
+// Behind a TLS-terminating reverse proxy the request arrives as plain http, so
+// a hard-coded http:// scheme emits a playlist whose inner stream URL points at
+// http://<public-host>. That survives only because the proxy redirects, costing
+// an extra round trip on every segment fetch -- and it breaks outright anywhere
+// mixed content is refused. Trust X-Forwarded-Proto when a proxy sets it.
+function externalBase(req) {
   const host = req.headers.host || `localhost:${STREAM_PORT}`;
-  const baseUrl = `http://${host}`;
+  const proto = (req.headers['x-forwarded-proto'] || '').split(',')[0].trim() || 'http';
+  return `${proto}://${host}`;
+}
+
+app.get('/playlist.m3u',(req,res)=>{
+  const baseUrl = externalBase(req);
   const m3uContent = `#EXTM3U
 #EXTINF:-1 channel-id="weatherStar4000" tvg-id="weatherStar4000" tvg-channel-no="275" tvc-guide-placeholders="3600" tvc-guide-title="Local Weather" tvc-guide-description="Enjoy your local weather with a touch of nostalgia." tvc-guide-art="${baseUrl}/logo/ws4000.png" tvg-logo="${baseUrl}/logo/ws4000.png",WeatherStar 4000
 ${baseUrl}/stream/stream.m3u8
@@ -660,8 +669,7 @@ ${baseUrl}/stream/stream.m3u8
 });
 
 app.get('/guide.xml',(req,res)=>{
-  const host = req.headers.host || `localhost:${STREAM_PORT}`;
-  res.set('Content-Type','application/xml'); res.send(generateXMLTV(host));
+  res.set('Content-Type','application/xml'); res.send(generateXMLTV(externalBase(req)));
 });
 
 app.get('/health',(req,res)=>{
